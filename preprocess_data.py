@@ -78,6 +78,7 @@ def main():
             review_count += 1
 
             review_id = review.get("review_id")
+            book_id = review.get("book_id")
             sentences = review.get("review_sentences") or []
 
             for sentence_index, item in enumerate(sentences):
@@ -92,6 +93,7 @@ def main():
 
                 record = {
                     "review_id": review_id,
+                    "book_id": book_id,
                     "sentence_index": sentence_index,
                     "text": text,
                     "label": label,
@@ -117,6 +119,11 @@ def main():
     print(f"500자 이상 문장: {long_sentence_count:,}")
     print(f"제외한 레코드 수: {skipped_count:,}")
     print(f"저장 경로: {OUTPUT_PATH.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
+
 
 
 if __name__ == "__main__":
