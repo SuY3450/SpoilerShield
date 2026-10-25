@@ -7,12 +7,14 @@ INPUT_PATH = Path("data/processed/sentences.jsonl")
 OUTPUT_DIR = Path("data/processed/splits")
 
 
-def choose_split(review_id):
-    """Deterministically assign a whole review to one split."""
-    if review_id is None:
-        raise ValueError("Missing review_id; cannot safely split by review.")
-    digest = hashlib.sha256(str(review_id).encode("utf-8")).hexdigest()
+def choose_split(book_id):
+    """Assign all reviews of the same book to one split."""
+    if book_id is None or str(book_id).strip() == "":
+        raise ValueError("Missing book_id; cannot safely split by book.")
+
+    digest = hashlib.sha256(str(book_id).encode("utf-8")).hexdigest()
     bucket = int(digest[:8], 16) % 100
+
     if bucket < 80:
         return "train"
     if bucket < 90:
@@ -36,9 +38,12 @@ def main():
     sentence_counts = Counter()
     label_counts = {name: Counter() for name in ("train", "validation", "test")}
     review_ids = {name: set() for name in ("train", "validation", "test")}
+    book_ids = {name: set() for name in ("train", "validation", "test")}
     long_counts = Counter()
     malformed_lines = 0
+    missing_book_ids = 0
     missing_review_ids = 0
+    invalid_labels = 0
 
     with open(INPUT_PATH, "r", encoding="utf-8") as source, \
          open(output_paths["train"], "w", encoding="utf-8") as train_file, \
@@ -60,17 +65,31 @@ def main():
                 malformed_lines += 1
                 continue
 
+            book_id = record.get("book_id")
+            if book_id is None or str(book_id).strip() == "":
+                missing_book_ids += 1
+                continue
+
             review_id = record.get("review_id")
-            if review_id is None:
+            if review_id is None or str(review_id).strip() == "":
                 missing_review_ids += 1
                 continue
 
-            split = choose_split(review_id)
-            targets[split].write(json.dumps(record, ensure_ascii=False) + "\n")
+            label = record.get("label")
+            if label not in (0, 1):
+                invalid_labels += 1
+                continue
+
+            split = choose_split(book_id)
+            targets[split].write(
+                json.dumps(record, ensure_ascii=False) + "\n"
+            )
 
             sentence_counts[split] += 1
-            label_counts[split][record.get("label")] += 1
-            review_ids[split].add(review_id)
+            label_counts[split][label] += 1
+            review_ids[split].add(record["review_id"])
+            book_ids[split].add(str(book_id))
+
             if record.get("is_long"):
                 long_counts[split] += 1
 
@@ -80,10 +99,10 @@ def main():
     print("\nData split complete")
     print(f"Input: {INPUT_PATH.resolve()}")
     print(f"Output folder: {OUTPUT_DIR.resolve()}")
-    print("Split rule: deterministic SHA-256 hash of review_id")
+    print("Split rule: deterministic SHA-256 hash of book_id")
     print("Target proportions: train 80%, validation 10%, test 10%")
-    print("Whole reviews stay together; exact ratios may vary slightly.")
-
+    print("All sentences from the same book stay in one split; exact ratios may vary.")
+    
     for name in ("train", "validation", "test"):
         count = sentence_counts[name]
         pct = count / total_sentences * 100 if total_sentences else 0
@@ -104,16 +123,32 @@ def main():
         | review_ids["validation"] & review_ids["test"]
     )
 
+    book_overlap = (
+        (book_ids["train"] & book_ids["validation"])
+        | (book_ids["train"] & book_ids["test"])
+        | (book_ids["validation"] & book_ids["test"])
+    )
+
     print("\n[VALIDATION]")
     print(f"Total reviews across splits: {total_reviews:,}")
     print(f"Review ID overlap across splits: {len(overlap):,}")
+    print(f"Book ID overlap across splits: {len(book_overlap):,}")
     print(f"Malformed JSON lines skipped: {malformed_lines:,}")
-    print(f"Records missing review_id skipped: {missing_review_ids:,}")
+    print(f"Records missing book_id skipped: {missing_book_ids}")
+    print(f"Records missing review_id skipped: {missing_review_ids}")
+    print(f"Records with invalid labels skipped: {invalid_labels}")
 
-    if not overlap and not malformed_lines and not missing_review_ids:
-        print("PASS: No review leakage detected; all input records were assigned.")
+    if (
+        not overlap 
+        and not book_overlap 
+        and not malformed_lines 
+        and not missing_book_ids 
+        and not missing_review_ids
+        and not invalid_labels
+    ):
+        print("PASS: No review/book leakage detected; all valid input records were assigned.")
     else:
-        print("CHECK: Review overlap or skipped records need investigation.")
+        print("CHECK: Overlap or skipped records need investigation.")
 
 
 if __name__ == "__main__":
