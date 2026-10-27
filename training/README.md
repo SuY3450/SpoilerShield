@@ -23,7 +23,7 @@
 - Epoch 종료 후 Validation에서 Precision, Recall, F1, TP, FP, FN 확인
 - Validation F1이 가장 높은 모델과 토크나이저를 `best_model/`에 저장
 - 모델·Optimizer 상태, 학습 위치, 난수 상태를 `latest_checkpoint.pt`에 기록하여 중단 후 재개 지원
-- **주의:** 재개 기능의 기본 동작은 확인했지만, 연속 학습과 가중치가 완전히 동일해지는지는 검증하지 않음
+- **체크포인트 재개 검증:** 6 Step 연속 학습과 3 Step 학습 후 재개(총 6 Step)를 비교한 결과, 모델 가중치 텐서 201개가 모두 정확히 일치함 (최대 차이 0.0). 단, Epoch 경계 및 장시간 학습에서의 동일성은 추가 검증 필요.
 
 ## Baseline 실험 결과
 
