@@ -1,19 +1,22 @@
-"""SpoilerShield: epoch shuffle + checkpoint resume."""
+"""SpoilerShield baseline training with full-validation model selection.
 
+Train and validate on existing, disjoint processed splits. Every epoch evaluates
+ALL validation rows; the best model is selected by full-validation F1.
+"""
 import argparse
 import json
+import math
 import random
 from pathlib import Path
 
 import numpy as np
 import torch
-from sklearn.metrics import precision_recall_fscore_support
 
 from model_setup.model import create_model, create_tokenizer
 from model_setup.dataset import load_tokenized_splits, create_dataloader
 
 
-def set_seed(seed):
+def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -21,300 +24,228 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def save_checkpoint(path, model, optimizer, state, args):
-    saved = {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "state": state.copy(),
-        "settings": vars(args),
-        "rng_torch": torch.get_rng_state(),
-        "rng_python": random.getstate(),
-        "rng_numpy": np.random.get_state(),
-    }
-
-    if torch.cuda.is_available():
-        saved["rng_cuda"] = torch.cuda.get_rng_state_all()
-
+def write_json_atomic(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(".tmp")
-    torch.save(saved, temp)
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     temp.replace(path)
 
-    print(
-        f"[Checkpoint] Epoch {state['epoch'] + 1}, "
-        f"Step {state['step']} 저장 완료",
-        flush=True,
-    )
 
-
-def load_checkpoint(path, model, optimizer, args, device):
-    saved = torch.load(path, map_location="cpu", weights_only=False)
-
-    keys = [
-        "train_file", "val_file", "mode", "epochs",
-        "batch_size", "lr", "max_length", "seed",
-        "max_train_steps", "max_val_steps",
-    ]
-
-    for key in keys:
-        if saved["settings"][key] != getattr(args, key):
-            raise ValueError(f"설정 불일치: {key}")
-
-    model.load_state_dict(saved["model"])
-    optimizer.load_state_dict(saved["optimizer"])
-
-    for values in optimizer.state.values():
-        for key, value in values.items():
-            if isinstance(value, torch.Tensor):
-                values[key] = value.to(device)
-
-    return saved
-
-
-def restore_rng(saved):
-    torch.set_rng_state(saved["rng_torch"])
-    random.setstate(saved["rng_python"])
-    np.random.set_state(saved["rng_numpy"])
-
-    if torch.cuda.is_available() and "rng_cuda" in saved:
-        torch.cuda.set_rng_state_all(saved["rng_cuda"])
-
-
-@torch.no_grad()
-def validate(model, loader, device, max_steps):
-    model.eval()
-    losses, predictions, labels = [], [], []
-
-    for i, batch in enumerate(loader):
-        if i >= max_steps:
-            break
-
-        batch = {k: v.to(device) for k, v in batch.items()}
-        output = model(**batch)
-
-        losses.append(output.loss.item())
-        predictions.extend(output.logits.argmax(-1).cpu().tolist())
-        labels.extend(batch["labels"].cpu().tolist())
-
-    if not labels:
-        raise ValueError("Validation 데이터가 비어 있습니다.")
-
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        labels, predictions, average="binary",
-        pos_label=1, zero_division=0
-    )
-
-    tp = sum(p == 1 and y == 1 for p, y in zip(predictions, labels))
-    fp = sum(p == 1 and y == 0 for p, y in zip(predictions, labels))
-    fn = sum(p == 0 and y == 1 for p, y in zip(predictions, labels))
-
-    return {
-        "val_loss": float(np.mean(losses)),
-        "precision": float(precision),
-        "recall": float(recall),
-        "f1": float(f1),
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "val_samples": len(labels),
+def save_checkpoint(path, model, optimizer, state, args):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "state": state,
+        "settings": vars(args),
+        "torch_rng": torch.get_rng_state(),
+        "numpy_rng": np.random.get_state(),
+        "python_rng": random.getstate(),
     }
+    if torch.cuda.is_available():
+        payload["cuda_rng"] = torch.cuda.get_rng_state_all()
+    temp = path.with_name(path.name + ".tmp")
+    torch.save(payload, temp)
+    temp.replace(path)
+    print(f"[Checkpoint] next_epoch={state['epoch'] + 1}, step={state['step']}", flush=True)
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--train-file", required=True)
-    p.add_argument("--val-file", required=True)
-    p.add_argument("--output-dir", required=True)
-    p.add_argument("--mode", choices=["baseline", "ours"], default="baseline")
-    p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--lr", type=float, default=2e-5)
-    p.add_argument("--max-length", type=int, default=256)
-    p.add_argument("--max-train-steps", type=int, default=15752)
-    p.add_argument("--max-val-steps", type=int, default=445)
-    p.add_argument("--save-steps", type=int, default=2000)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--resume", action="store_true")
+def load_checkpoint(path, model, optimizer, device, args):
+    # Only load checkpoints created by you: they contain pickled Python RNG states.
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    for key in ("train_file", "val_file", "mode", "batch_size", "lr", "max_length", "seed", "expected_val_samples", "expected_val_spoilers"):
+        if payload["settings"][key] != getattr(args, key):
+            raise ValueError(f"Checkpoint setting mismatch: {key}")
+    if args.epochs < payload["state"]["epoch"]:
+        raise ValueError("Requested --epochs is smaller than completed epochs")
+    model.load_state_dict(payload["model"])
+    optimizer.load_state_dict(payload["optimizer"])
+    for group in optimizer.state.values():
+        for key, value in group.items():
+            if isinstance(value, torch.Tensor):
+                group[key] = value.to(device)
+    return payload
 
-    # 재개 기능 테스트용: 지정한 전체 Step에서 정상 중단
-    p.add_argument("--stop-after-steps", type=int, default=None)
 
-    args = p.parse_args()
+def restore_rng(payload):
+    torch.set_rng_state(payload["torch_rng"])
+    np.random.set_state(payload["numpy_rng"])
+    random.setstate(payload["python_rng"])
+    if torch.cuda.is_available() and "cuda_rng" in payload:
+        torch.cuda.set_rng_state_all(payload["cuda_rng"])
 
-    if min(args.epochs, args.batch_size, args.max_train_steps,
-           args.max_val_steps, args.save_steps) < 1:
-        p.error("Epoch 및 Step 설정은 1 이상이어야 합니다.")
 
-    if args.stop_after_steps is not None and args.stop_after_steps < 1:
-        p.error("--stop-after-steps는 1 이상이어야 합니다.")
-
-    for filename in [args.train_file, args.val_file]:
-        if not Path(filename).is_file():
-            p.error(f"파일 없음: {filename}")
-
-    set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint = output_dir / "latest_checkpoint.pt"
-
-    tokenizer = create_tokenizer()
-    model = create_model().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-
-    data = load_tokenized_splits(
+def load_data(tokenizer, args):
+    return load_tokenized_splits(
         tokenizer,
         mode=args.mode,
         max_length=args.max_length,
-        data_files={
-            "train": args.train_file,
-            "validation": args.val_file,
-        },
+        data_files={"train": args.train_file, "validation": args.val_file},
         splits=("train", "validation"),
         streaming=True,
     )
 
-    state = {
-        "epoch": 0,
-        "step": 0,
-        "global_step": 0,
-        "loss_sum": 0.0,
-        "loss_count": 0,
-        "best_f1": -1.0,
-        "history": [],
-    }
 
-    saved = None
-    if args.resume:
-        saved = load_checkpoint(
-            checkpoint, model, optimizer, args, device
+@torch.inference_mode()
+def validate_full(model, loader, device, expected_samples, expected_spoilers):
+    model.eval()
+    tp = fp = tn = fn = 0
+    processed = 0
+    for batch in loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        logits = model(**batch).logits
+        predictions = logits.argmax(dim=-1)
+        labels = batch["labels"]
+        tp += int(((predictions == 1) & (labels == 1)).sum().item())
+        fp += int(((predictions == 1) & (labels == 0)).sum().item())
+        tn += int(((predictions == 0) & (labels == 0)).sum().item())
+        fn += int(((predictions == 0) & (labels == 1)).sum().item())
+        count = labels.numel()
+        processed += count
+        if processed % 100000 < count:
+            print(f"  Validation: {processed:,}/{expected_samples:,}", flush=True)
+        if processed > expected_samples:
+            raise ValueError(f"Validation exceeds expected count: {processed} > {expected_samples}")
+    if processed != expected_samples:
+        raise ValueError(f"INCOMPLETE validation: {processed} != {expected_samples}. No best model selected.")
+    if tp + fp + tn + fn != processed:
+        raise AssertionError("Confusion matrix counts do not match")
+    actual_spoilers = tp + fn
+    if actual_spoilers != expected_spoilers:
+        raise ValueError(
+            f"Validation label count mismatch: Spoiler={actual_spoilers:,}, "
+            f"expected={expected_spoilers:,}. No best model selected."
         )
-        state = saved["state"]
+    print(f"  Validation verified: {processed:,} rows, {actual_spoilers:,} spoilers", flush=True)
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    fpr = fp / (fp + tn) if fp + tn else 0.0
+    return dict(val_samples=processed, tp=tp, fp=fp, tn=tn, fn=fn,
+                precision=precision, recall=recall, f1=f1, fpr=fpr,
+                actual_spoilers=tp + fn, predicted_spoilers=tp + fp)
 
-        print(
-            f"재개 위치: Epoch {state['epoch'] + 1}, "
-            f"Step {state['step']}",
-            flush=True,
-        )
 
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--train-file", required=True)
+    parser.add_argument("--val-file", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--mode", choices=["baseline", "ours"], default="baseline")
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--max-length", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save-steps", type=int, default=2000)
+    parser.add_argument("--expected-val-samples", type=int, required=True,
+                        help="Exact full validation sentence count; fail closed if different")
+    parser.add_argument("--expected-val-spoilers", type=int, default=56706,
+                        help="Exact spoiler count in the original full validation split (default: 56706)")
+    parser.add_argument("--save-all-epochs", action="store_true",
+                        help="Also keep each epoch's complete model/tokenizer")
+    parser.add_argument("--resume", action="store_true")
+    args = parser.parse_args()
+    if args.epochs < 1 or args.batch_size < 1 or args.save_steps < 1 or args.expected_val_samples < 1:
+        parser.error("epochs, batch size, save steps and expected val samples must be positive")
+    if not 0 <= args.expected_val_spoilers <= args.expected_val_samples:
+        parser.error("expected-val-spoilers must be between 0 and expected-val-samples")
+    for file in (args.train_file, args.val_file):
+        if not Path(file).is_file():
+            parser.error(f"File does not exist: {file}")
+    if Path(args.train_file).resolve() == Path(args.val_file).resolve():
+        parser.error("Train and validation paths must differ")
+
+    output_dir = Path(args.output_dir)
+    checkpoint_path = output_dir / "latest_checkpoint.pt"
+    if output_dir.exists() and any(output_dir.iterdir()) and not args.resume:
+        parser.error("Output dir is not empty; choose a NEW directory or pass --resume")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    seed_everything(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device, flush=True)
+    tokenizer = create_tokenizer()
+    model = create_model().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    state = {"epoch": 0, "step": 0, "global_step": 0, "loss_sum": 0.0,
+             "loss_count": 0, "best_f1": -1.0, "best_epoch": None, "history": []}
+    resume_payload = None
+    if args.resume:
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(checkpoint_path)
+        resume_payload = load_checkpoint(checkpoint_path, model, optimizer, device, args)
+        state = resume_payload["state"]
+        print(f"Resuming epoch {state['epoch'] + 1}, batch {state['step']}", flush=True)
+
+    data = load_data(tokenizer, args)
+    write_json_atomic(output_dir / "config.json", vars(args))
 
     for epoch in range(state["epoch"], args.epochs):
-        print(f"\n===== Epoch {epoch + 1}/{args.epochs} =====", flush=True)
-
-        train_loader = create_dataloader(
-            data["train"], tokenizer,
-            batch_size=args.batch_size,
-            shuffle=True,
-            seed=args.seed + epoch,
-        )
-
+        # Keep RNG replay compatible with the current dataset loader implementation.
+        train_loader = create_dataloader(data["train"], tokenizer,
+                                         batch_size=args.batch_size, shuffle=True,
+                                         seed=args.seed + epoch)
         iterator = iter(train_loader)
         skip = state["step"] if epoch == state["epoch"] else 0
-
         for _ in range(skip):
             try:
                 next(iterator)
-            except StopIteration:
-                raise RuntimeError("재개 위치가 데이터 범위를 초과했습니다.")
-
-        # DataLoader 재구성과 건너뛰기가 끝난 후 난수 상태 복원
-        if saved is not None and epoch == state["epoch"]:
-            restore_rng(saved)
-
+            except StopIteration as exc:
+                raise ValueError("Checkpoint step exceeds train dataset length") from exc
+        if resume_payload is not None:
+            # Data-loader creation and skipped batches can consume RNG. Restore the
+            # saved training RNG only after reaching the resume boundary.
+            restore_rng(resume_payload)
+            resume_payload = None
         model.train()
-
-        while state["step"] < args.max_train_steps:
-            try:
-                batch = next(iterator)
-            except StopIteration:
-                break
-
+        processed_batches = skip
+        print(f"Epoch {epoch + 1}/{args.epochs}, skip={skip}", flush=True)
+        for batch in iterator:
             batch = {k: v.to(device) for k, v in batch.items()}
-
             optimizer.zero_grad()
-            output = model(**batch)
-            loss = output.loss
+            loss = model(**batch).loss
             loss.backward()
             optimizer.step()
-
-            state["step"] += 1
+            processed_batches += 1
+            state["step"] = processed_batches
             state["global_step"] += 1
-            state["loss_sum"] += loss.item()
+            state["loss_sum"] += float(loss.item())
             state["loss_count"] += 1
-
-            if state["step"] % 100 == 0:
-                print(
-                    f"Epoch {epoch + 1} | Step {state['step']} "
-                    f"| Loss {loss.item():.4f}",
-                    flush=True,
-                )
-
+            if state["global_step"] % 100 == 0:
+                print(f"  step={state['global_step']}, train_loss={loss.item():.5f}", flush=True)
             if state["global_step"] % args.save_steps == 0:
-                save_checkpoint(
-                    checkpoint, model, optimizer, state, args
-                )
+                save_checkpoint(checkpoint_path, model, optimizer, state, args)
+        if processed_batches == 0:
+            raise ValueError("Empty training dataset")
 
-            if (
-                args.stop_after_steps is not None
-                and state["global_step"] >= args.stop_after_steps
-            ):
-                save_checkpoint(
-                    checkpoint, model, optimizer, state, args
-                )
-                print("테스트용 중단 완료", flush=True)
-                return
-
-        val_loader = create_dataloader(
-            data["validation"], tokenizer,
-            batch_size=args.batch_size,
-            shuffle=False,
-        )
-
-        metrics = validate(
-            model, val_loader, device, args.max_val_steps
-        )
-
-        metrics["epoch"] = epoch + 1
-        metrics["train_loss"] = (
-            state["loss_sum"] / state["loss_count"]
-        )
-        metrics["global_step"] = state["global_step"]
-
-        state["history"].append(metrics)
-
-        print("Validation:", metrics, flush=True)
-
+        avg_train_loss = state["loss_sum"] / max(1, state["loss_count"])
+        val_loader = create_dataloader(data["validation"], tokenizer,
+                                       batch_size=args.batch_size, shuffle=False)
+        print(f"Epoch {epoch + 1}: full validation starting", flush=True)
+        metrics = validate_full(model, val_loader, device, args.expected_val_samples, args.expected_val_spoilers)
+        metrics.update(epoch=epoch + 1, train_loss=avg_train_loss, train_batches=processed_batches)
+        if args.save_all_epochs:
+            epoch_dir = output_dir / f"epoch_{epoch + 1}"
+            model.save_pretrained(epoch_dir, safe_serialization=True)
+            tokenizer.save_pretrained(epoch_dir)
         if metrics["f1"] > state["best_f1"]:
+            best_dir = output_dir / "best_model"
+            model.save_pretrained(best_dir, safe_serialization=True)
+            tokenizer.save_pretrained(best_dir)
             state["best_f1"] = metrics["f1"]
-            model.save_pretrained(output_dir / "best_model")
-            tokenizer.save_pretrained(output_dir / "best_model")
-            print("Best Model 저장 완료!", flush=True)
-
-        (output_dir / "history.json").write_text(
-            json.dumps(state["history"], indent=2),
-            encoding="utf-8",
-        )
-        (output_dir / "config.json").write_text(
-            json.dumps(vars(args), indent=2),
-            encoding="utf-8",
-        )
-
-        # 다음 Epoch 시작 위치로 변경
+            state["best_epoch"] = epoch + 1
+            print(f"  NEW BEST: epoch {epoch + 1}, F1={metrics['f1']:.6f}", flush=True)
+        state["history"].append(metrics)
+        write_json_atomic(output_dir / "history.json", state["history"])
         state["epoch"] = epoch + 1
         state["step"] = 0
         state["loss_sum"] = 0.0
         state["loss_count"] = 0
+        save_checkpoint(checkpoint_path, model, optimizer, state, args)
+        print(f"Epoch {epoch + 1} complete: {metrics}", flush=True)
 
-        save_checkpoint(
-            checkpoint, model, optimizer, state, args
-        )
-
-        saved = None
-
-    print("\n학습 완료!", flush=True)
-    print("Best Validation F1:", round(state["best_f1"], 4))
+    print(f"Done. Best epoch: {state['best_epoch']}, F1: {state['best_f1']:.6f}", flush=True)
 
 
 if __name__ == "__main__":
